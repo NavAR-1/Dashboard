@@ -4,7 +4,9 @@ const { hashPassword } = require('../src/domain/password');
 
 async function main(){
   console.log('Truncating tables...');
-  await pool.query('TRUNCATE access_logs, feedback, system_settings, qr_scans, poi_categories, navigation_sessions, visit_series, routes, ar_markers, navigation_nodes, buildings, admin_users RESTART IDENTITY CASCADE');
+  // Truncate both session tables + legacy table + all dependent tables
+  await pool.query('TRUNCATE access_logs, feedback, system_settings, qr_scans, poi_categories, indoor_sessions, outdoor_sessions, navigation_sessions, graph_edges, qr_anchors, graph_nodes, buildings, admin_users RESTART IDENTITY CASCADE');
+  // visit_series is a VIEW derived from indoor_sessions — no truncate needed
 
   console.log('Inserting admin users...');
   const roles = await pool.query('SELECT id, role_key FROM roles');
@@ -177,8 +179,8 @@ async function main(){
   const nodeMap = [];
   for(let n of nodes){
     const res = await pool.query(
-      'INSERT INTO navigation_nodes (node_name, location, floor_label, node_type, is_published, is_staff_only) ' +
-      'VALUES ($1, ST_SetSRID(ST_MakePoint($2,$3), 4326)::geography, $4, $5, $6, $7) RETURNING id, node_name',
+      'INSERT INTO graph_nodes (node_name, latitude, longitude, location, floor_label, node_type, is_published, is_staff_only) ' +
+      'VALUES ($1, $3, $2, ST_SetSRID(ST_MakePoint($2,$3), 4326)::geography, $4, $5, $6, $7) RETURNING id, node_name',
       [n.name, n.lon, n.lat, n.floor, n.type, n.published, n.staff]
     );
     nodeMap.push(res.rows[0]);
@@ -191,7 +193,7 @@ async function main(){
     // connect consecutive nodes in the list with a random distance between 5.0 and 20.0 meters
     if (i % 5 !== 0) { // Keep some separation
       const distance = Math.round((5 + Math.random() * 15) * 10) / 10;
-      await pool.query('INSERT INTO routes (start_node, end_node, distance) VALUES ($1,$2,$3)', [nodeMap[i].id, nodeMap[i+1].id, distance]);
+      await pool.query('INSERT INTO graph_edges (start_node, end_node, distance) VALUES ($1,$2,$3)', [nodeMap[i].id, nodeMap[i+1].id, distance]);
     }
   }
 
@@ -202,10 +204,10 @@ async function main(){
   const blockGEntry = nodeMap.find(n => n.node_name === 'Block G - Primary Reactor Lobby Zone');
   const blockHEntry = nodeMap.find(n => n.node_name === 'Block H - Diagonal Connection Bridge Ground');
   
-  if (blockHEntry && blockBEntry) await pool.query('INSERT INTO routes (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockBEntry.id, 12.8]);
-  if (blockHEntry && blockCEntry) await pool.query('INSERT INTO routes (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockCEntry.id, 14.5]);
-  if (blockHEntry && blockFEntry) await pool.query('INSERT INTO routes (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockFEntry.id, 16.2]);
-  if (blockHEntry && blockGEntry) await pool.query('INSERT INTO routes (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockGEntry.id, 11.3]);
+  if (blockHEntry && blockBEntry) await pool.query('INSERT INTO graph_edges (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockBEntry.id, 12.8]);
+  if (blockHEntry && blockCEntry) await pool.query('INSERT INTO graph_edges (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockCEntry.id, 14.5]);
+  if (blockHEntry && blockFEntry) await pool.query('INSERT INTO graph_edges (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockFEntry.id, 16.2]);
+  if (blockHEntry && blockGEntry) await pool.query('INSERT INTO graph_edges (start_node, end_node, distance) VALUES ($1,$2,$3)', [blockHEntry.id, blockGEntry.id, 11.3]);
 
   console.log('Seeding AR markers...');
   const arMarkers = [
@@ -219,20 +221,12 @@ async function main(){
   for (let m of arMarkers) {
     const linkedNode = nodeMap.find(n => n.node_name === m.nodeName);
     await pool.query(
-      'INSERT INTO ar_markers (marker_name, location, model_path, linked_node, status) VALUES ($1, ST_SetSRID(ST_MakePoint($2,$3), 4326)::geography, $4, $5, $6)',
+      'INSERT INTO qr_anchors (marker_name, latitude, longitude, location, model_path, linked_node, status) VALUES ($1, $3, $2, ST_SetSRID(ST_MakePoint($2,$3), 4326)::geography, $4, $5, $6)',
       [m.name, m.lon, m.lat, m.path, linkedNode?.id || null, 'active']
     );
   }
 
-  console.log('Seeding visit series...');
-  const today = new Date();
-  for(let i=6; i>=0; i-=1){
-    const day = new Date(today);
-    day.setDate(today.getDate() - i);
-    const requests = 145 + (6-i)*22 + (i%2)*14;
-    await pool.query('INSERT INTO visit_series (day, route_requests, successful_routes) VALUES ($1,$2,$3)', 
-      [day.toISOString().slice(0,10), requests, Math.round(requests * 0.94)]);
-  }
+  // visit_series is a live VIEW derived from navigation_sessions — no insert needed.
 
   console.log('Seeding navigation sessions...');
   // Let's create some sessions
@@ -240,28 +234,44 @@ async function main(){
   const bResearchNode = nodeMap.find(n => n.node_name === 'Block B - Director of Research Center Office');
   const cComputingNode = nodeMap.find(n => n.node_name === 'Block C - HPC & Interior Design Lab Ground');
   const fLobbyNode = nodeMap.find(n => n.node_name === 'Block F - Main Lobby Node');
-  const qrMarkerRows = await pool.query('SELECT id, marker_name, linked_node FROM ar_markers ORDER BY id');
+  const qrMarkerRows = await pool.query('SELECT id, marker_name, linked_node FROM qr_anchors ORDER BY id');
   const markerForNode = nodeId => qrMarkerRows.rows.find(marker => marker.linked_node === nodeId)?.marker_name || `AR-${nodeId || 'UNKNOWN'}`;
 
-  const sessionData = [
-    { scope: 'inside', start: bLobbyNode?.id, end: bResearchNode?.id, session_status: 'completed', session_id: 'inside-demo-001' },
-    { scope: 'inside', start: bLobbyNode?.id, end: cComputingNode?.id, session_status: 'completed', session_id: 'inside-demo-002' },
-    { scope: 'inside', start: fLobbyNode?.id, end: bResearchNode?.id, session_status: 'cancelled', session_id: 'inside-demo-003' },
-    { scope: 'outside', start: cComputingNode?.id, end: fLobbyNode?.id, session_status: 'completed', session_id: 'outside-demo-001' },
-    { scope: 'outside', start: bLobbyNode?.id, end: fLobbyNode?.id, session_status: 'completed', session_id: 'outside-demo-002' },
-    { scope: 'outside', start: fLobbyNode?.id, end: cComputingNode?.id, session_status: 'cancelled', session_id: 'outside-demo-003' }
+  // Indoor sessions — seeded into indoor_sessions (from mobile Unity app)
+  const indoorData = [
+    { start: bLobbyNode?.id, end: bResearchNode?.id,  session_status: 'completed', session_id: 'inside-demo-001' },
+    { start: bLobbyNode?.id, end: cComputingNode?.id, session_status: 'completed', session_id: 'inside-demo-002' },
+    { start: fLobbyNode?.id, end: bResearchNode?.id,  session_status: 'cancelled', session_id: 'inside-demo-003' },
   ];
 
-  const sessionIds = [];
-  for (let s of sessionData) {
+  const indoorSessionIds = [];
+  for (const s of indoorData) {
     if (!s.start || !s.end) continue;
     const res = await pool.query(
-      'INSERT INTO navigation_sessions (session_scope, qr_id, destination, session_status, visited_node_ids, session_id, client_created_at) ' +
-      'VALUES ($1, $2, $3, $4, $5::jsonb, $6, NOW() - INTERVAL \'3 hours\') RETURNING id',
-      [s.scope, markerForNode(s.start), s.end, s.session_status, JSON.stringify([String(s.start)]), s.session_id]
+      `INSERT INTO indoor_sessions (qr_id, destination, session_status, visited_node_ids, session_id, client_created_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, NOW() - INTERVAL '3 hours') RETURNING id`,
+      [markerForNode(s.start), String(s.end), s.session_status, JSON.stringify([String(s.start)]), s.session_id]
     );
-    sessionIds.push(res.rows[0].id);
+    indoorSessionIds.push(res.rows[0].id);
   }
+
+  // Outdoor sessions — seeded into outdoor_sessions (from outdoor navigation API)
+  const outdoorData = [
+    { qr_id: 'QR-C-G-Corridor', dest: fLobbyNode?.id,    session_status: 'completed', session_id: 'outside-demo-001', source: 'demo' },
+    { qr_id: 'QR-B-G-Lobby',    dest: fLobbyNode?.id,    session_status: 'completed', session_id: 'outside-demo-002', source: 'demo' },
+    { qr_id: 'QR-F-G-Lobby',    dest: cComputingNode?.id, session_status: 'cancelled', session_id: 'outside-demo-003', source: 'demo' },
+  ];
+
+  for (const s of outdoorData) {
+    await pool.query(
+      `INSERT INTO outdoor_sessions (qr_id, destination, session_status, session_id, source, client_created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '3 hours')`,
+      [s.qr_id, s.dest ? String(s.dest) : null, s.session_status, s.session_id, s.source]
+    );
+  }
+
+  // Keep sessionIds pointing to indoor for feedback linkage
+  const sessionIds = indoorSessionIds;
 
   console.log('Seeding QR scans...');
   for (let marker of qrMarkerRows.rows) {

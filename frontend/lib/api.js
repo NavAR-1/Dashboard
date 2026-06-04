@@ -25,8 +25,9 @@ async function apiFetch(path, token, options = {}) {
 export const getSidebar       = (token)              => apiFetch('/admin/sidebar', token);
 export const getDashboard     = (token)              => apiFetch('/admin/dashboard', token);
 export const getSessions      = (token, scope)       => apiFetch('/mobile/navigation-sessions' + (scope ? `?scope=${scope}` : ''), token);
-export const getOutdoorAnalytics = (token)           => apiFetch('/outdoor/analytics', token);
-export const getOutdoorSessions  = (token)           => apiFetch('/outdoor/sessions', token);
+export const getOutdoorAnalytics   = (token)           => apiFetch('/outdoor/analytics', token);
+export const getOutdoorCampusNodes = (token)           => apiFetch('/outdoor/campus-nodes', token);
+export const getOutdoorSessions    = (token)           => apiFetch('/outdoor/sessions', token);
 export const getOutdoorMap       = (token)           => apiFetch('/outdoor/map', token);
 export const getOutdoorDestinations = (token, params = {}) => apiFetch('/outdoor/map/destinations' + query(params), token);
 export const getOutdoorNodes     = (token, params = {}) => apiFetch('/outdoor/map/nodes' + query(params), token);

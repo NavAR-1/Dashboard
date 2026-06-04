@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import * as api from '../../lib/api';
 import { tok, useFetch, Pill, PHead, Empty, Spin, Err, Btn, Input, Sel, FGrid, TTable, TD, MsgBox } from './shared';
+import CampusHeatMap from '../CampusHeatMap';
 
 export function OverviewPanel() {
   const { data, loading, error, reload } = useFetch(() => api.getDashboard(tok()));
@@ -128,50 +129,30 @@ export function OverviewPanel() {
 }
 
 export function HeatMapPanel() {
-  const { data: dashboardData, loading: dashboardLoading } = useFetch(() => api.getDashboard(tok()));
-  const { data: outdoorData, loading: outdoorLoading } = useFetch(() => api.getOutdoorAnalytics(tok()));
-  const rawOutdoor = Array.isArray(outdoorData?.heatmap) ? outdoorData.heatmap : [];
-  const lats = rawOutdoor.map(([lat]) => Number(lat)).filter(Number.isFinite);
-  const lngs = rawOutdoor.map(([, lng]) => Number(lng)).filter(Number.isFinite);
-  const minLat = Math.min(...lats, 0);
-  const maxLat = Math.max(...lats, 1);
-  const minLng = Math.min(...lngs, 0);
-  const maxLng = Math.max(...lngs, 1);
-  const outdoorPts = rawOutdoor.slice(0, 18).map(([lat, lng, weight], index) => ({
-    node_name: `GPS ${index + 1}`,
-    latitude: Number(lat),
-    longitude: Number(lng),
-    intensity: weight
-  }));
-  const pts = outdoorPts.length ? outdoorPts : (dashboardData?.heatPoints || []).slice(0, 6);
-  const tones = ['hot', 'hot', 'warm', 'warm', 'cool', 'cool'];
-  const fallbackPos = [[66, 32], [35, 50], [57, 68], [22, 28], [77, 60], [50, 18]];
-  const maxWeight = Math.max(...pts.map(point => Number(point.intensity) || 0), 1);
+  const { data: dashboardData, loading } = useFetch(() => api.getDashboard(tok()));
+  const blockHeat = dashboardData?.blockHeat || [];
+
   return (
-    <article className="actualPanel heatMapPanel">
-      <PHead title="Outside Navigation Heat Map" action={<span style={{ fontSize: 12, color: '#94a3b8' }}>{outdoorPts.length ? 'Outdoor GPS feed' : 'Indoor fallback'}</span>} />
-      {dashboardLoading || outdoorLoading ? <Spin /> : (
-        <>
-          <div className="heatMapCanvas">
-            {pts.length === 0 ? <Empty msg="No heat map points found" /> : pts.map((p, i) => {
-              const normalized = Math.max(0.18, (Number(p.intensity) || 0) / maxWeight);
-              const left = outdoorPts.length && maxLng !== minLng ? 8 + ((p.longitude - minLng) / (maxLng - minLng)) * 84 : fallbackPos[i]?.[0] || 50;
-              const top = outdoorPts.length && maxLat !== minLat ? 92 - ((p.latitude - minLat) / (maxLat - minLat)) * 84 : fallbackPos[i]?.[1] || 50;
-              const size = 34 + normalized * 70;
-              return (
-                <span className={`heatPoint ${tones[i] || 'cool'}`} key={`${p.node_name}-${i}`}
-                  style={{ left: `${left}%`, top: `${top}%`, width: size, height: size }}>
-                  <b style={{ fontSize: 10, lineHeight: 1.2 }}>{outdoorPts.length ? Number(p.intensity) || 0 : p.node_name?.split(' ').slice(-2).join(' ')}</b>
-                </span>
-              );
-            })}
-          </div>
-          <div className="heatLegend"><span>Low</span><i /><span>High</span></div>
-        </>
+    <article className="actualPanel" style={{ background: '#080d1a', borderColor: 'rgba(30,47,74,0.6)' }}>
+      <PHead
+        title="AASTU Campus — Passage Density Heat Map"
+        action={
+          <span style={{ fontSize: 12, color: '#4dc8ff' }}>
+            {loading ? 'Loading…' : `${blockHeat.reduce((s, b) => s + (b.visit_count || 0), 0).toLocaleString()} total passages`}
+          </span>
+        }
+      />
+      {loading ? (
+        <div style={{ padding: 40 }}><Spin /></div>
+      ) : (
+        <div style={{ padding: '0 20px 20px' }}>
+          <CampusHeatMap blockHeat={blockHeat} />
+        </div>
       )}
     </article>
   );
 }
+
 
 export function SessionsPanel({ scope = 'inside' }) {
   if (scope !== 'inside') return <OutdoorNavigationPanel />;
@@ -263,38 +244,66 @@ export function SyncPanel() {
   );
 }
 
+function SyncBadge({ syncInfo }) {
+  if (!syncInfo) return null;
+  const { externalAvailable, sessionsSynced, syncedAt } = syncInfo;
+  const timeStr = syncedAt ? new Date(syncedAt).toLocaleTimeString() : '';
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5,
+      fontSize: 11, padding: '2px 8px', borderRadius: 12,
+      background: externalAvailable ? 'rgba(34,197,94,0.1)' : 'rgba(148,163,184,0.1)',
+      border: `1px solid ${externalAvailable ? 'rgba(34,197,94,0.3)' : 'rgba(148,163,184,0.2)'}`,
+      color: externalAvailable ? '#22c55e' : '#94a3b8'
+    }}>
+      <span style={{ width: 6, height: 6, borderRadius: '50%', background: externalAvailable ? '#22c55e' : '#94a3b8', display: 'inline-block' }} />
+      {externalAvailable
+        ? `External API live · ${sessionsSynced} synced${timeStr ? ' · ' + timeStr : ''}`
+        : `DB only · external API offline${timeStr ? ' · ' + timeStr : ''}`}
+    </span>
+  );
+}
+
 function OutdoorNavigationPanel() {
   const { data, loading, error, reload } = useFetch(() => api.getOutdoorAnalytics(tok()));
-  const stats = data?.stats || {};
-  const recent = Array.isArray(data?.recent) ? data.recent : [];
-  const destinations = Array.isArray(data?.destinations) ? data.destinations : [];
-  const routes = Array.isArray(data?.routes) ? data.routes : [];
-  const searches = Array.isArray(data?.searches) ? data.searches : [];
-  const heatmap = Array.isArray(data?.heatmap) ? data.heatmap : [];
+  const { data: campusData }             = useFetch(() => api.getOutdoorCampusNodes(tok()));
+  const stats        = data?.stats    || {};
+  const syncInfo     = data?.syncInfo || null;
+  const recent       = Array.isArray(data?.recent)        ? data.recent        : [];
+  const destinations = Array.isArray(data?.destinations)  ? data.destinations  : [];
+  const routes       = Array.isArray(data?.routes)        ? data.routes        : [];
+  const searches     = Array.isArray(data?.searches)      ? data.searches      : [];
+  const heatmap      = Array.isArray(data?.heatmap)       ? data.heatmap       : [];
+  const campusNodes  = Array.isArray(campusData?.nodes)   ? campusData.nodes   : [];
   const kpis = [
     ['Total Sessions', stats.total],
-    ['Completed', stats.completed],
-    ['Today', stats.today],
-    ['GPS Positions', stats.positions],
-    ['Searches', stats.searches],
-    ['Completion', stats.completion != null ? `${stats.completion}%` : null]
+    ['Completed',      stats.completed],
+    ['Cancelled',      stats.cancelled],
+    ['Today',          stats.today],
+    ['GPS Positions',  stats.positions],
+    ['Completion',     stats.completion != null ? `${stats.completion}%` : null]
   ];
 
   if (loading) return <article className="actualPanel"><Spin /></article>;
   if (error) {
     return (
       <article className="actualPanel">
-        <PHead title="Outside Navigation" action={<span>Outdoor API</span>} />
+        <PHead title="Outside Navigation" action={<SyncBadge syncInfo={{ externalAvailable: false }} />} />
         <Err msg={error} reload={reload} />
-        <p style={{ margin: '0 20px 20px', color: '#64748b', fontSize: 13 }}>
-          The outdoor API should be available at <code>https://naviagtion-2.onrender.com</code>.
-        </p>
       </article>
     );
   }
 
   return (
     <div className="actualPage">
+      <div style={{ marginBottom: 12 }}>
+        <SyncBadge syncInfo={syncInfo} />
+        {syncInfo?.errors?.length > 0 && (
+          <span style={{ marginLeft: 8, fontSize: 11, color: '#f59e0b' }}>
+            ⚠ {syncInfo.errors[0]}
+          </span>
+        )}
+      </div>
       <div className="actualMetricGrid">
         {kpis.map(([label, value]) => (
           <article className="actualMetric" key={label}>
@@ -305,7 +314,16 @@ function OutdoorNavigationPanel() {
       </div>
 
       <article className="actualPanel">
-        <PHead title="Recent Outdoor Sessions" count={recent.length} action={<span>{heatmap.length} heat points</span>} />
+        <PHead
+          title="Recent Outdoor Sessions"
+          count={recent.length}
+          action={
+            <span style={{ fontSize: 12, color: '#94a3b8' }}>
+              {data?.source === 'merged' ? '⟳ external + local' : '💾 local DB'}
+              {heatmap.length > 0 ? ` · ${heatmap.length} heat pts` : ''}
+            </span>
+          }
+        />
         {recent.length === 0 ? <Empty /> : (
           <TTable
             heads={['From', 'To', 'Route Length', 'Status', 'Started', 'Completed']}
@@ -315,9 +333,9 @@ function OutdoorNavigationPanel() {
                 <TD><b>{session.from_name || '-'}</b></TD>
                 <TD muted>{session.to_name || '-'}</TD>
                 <TD>{session.route_length ? `${Math.round(session.route_length)}m` : '-'}</TD>
-                <TD><Pill v={Number(session.completed) === 1 || session.completed === true ? 'Successful' : 'Failed'} /></TD>
-                <TD muted>{session.started_at || '-'}</TD>
-                <TD muted>{session.completed_at || '-'}</TD>
+                <TD><Pill v={Number(session.completed) === 1 || session.completed === true || session.session_status === 'completed' ? 'Successful' : 'Failed'} /></TD>
+                <TD muted>{session.started_at || session.client_created_at ? new Date(session.started_at || session.client_created_at).toLocaleString() : '-'}</TD>
+                <TD muted>{session.completed_at ? new Date(session.completed_at).toLocaleString() : '-'}</TD>
               </>
             )}
           />
@@ -371,6 +389,63 @@ function OutdoorNavigationPanel() {
             )}
           />
         )}
+      </article>
+
+      {/* AASTU Campus Map Nodes — live from external API */}
+      <article className="actualPanel">
+        <PHead
+          title="AASTU Campus Nodes"
+          count={campusNodes.length}
+          action={
+            <span style={{ fontSize: 11, color: '#94a3b8' }}>
+              Live from outdoor nav API
+            </span>
+          }
+        />
+        {campusNodes.length === 0 ? (
+          <p style={{ padding: '12px 20px', color: '#64748b', fontSize: 13 }}>
+            No campus nodes found — check that the outdoor API is reachable.
+          </p>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(220px,1fr))', gap: 8, padding: '0 20px 20px' }}>
+            {campusNodes.map(node => (
+              <div key={node.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: '8px 12px', background: '#f8fafc' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#1e293b' }}>{node.name}</span>
+                  <span style={{ fontSize: 10, background: '#e2e8f0', color: '#475569', borderRadius: 4, padding: '1px 5px', whiteSpace: 'nowrap' }}>{node.type}</span>
+                </div>
+                {node.id && <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>ID: {node.id}</div>}
+                {node.notes && <div style={{ fontSize: 11, color: '#64748b', marginTop: 3, lineHeight: 1.4 }}>{node.notes}</div>}
+                {node.lat && node.lng && (
+                  <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 4, fontFamily: 'monospace' }}>
+                    {Number(node.lat).toFixed(5)}, {Number(node.lng).toFixed(5)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </article>
+
+      {/* Tracking endpoint info for mobile app configuration */}
+      <article className="actualPanel" style={{ background: '#f0fdf4', border: '1px solid #bbf7d0' }}>
+        <PHead title="Outdoor Mobile App Connection" />
+        <div style={{ padding: '0 20px 20px', fontSize: 13, color: '#166534' }}>
+          <p style={{ marginBottom: 8 }}>
+            The outdoor navigation mobile app should point to <strong>this backend</strong> for session tracking.
+            All outdoor data is stored locally and forwarded to the external API.
+          </p>
+          <div style={{ background: '#dcfce7', borderRadius: 6, padding: '10px 14px', fontFamily: 'monospace', fontSize: 12, lineHeight: 2 }}>
+            <div><b>Base URL:</b> {typeof window !== 'undefined' ? window.location.origin.replace('3000','4000').replace('3001','4000') : 'http://localhost:4000'}</div>
+            <div><b>POST</b> /api/outdoor/track/session/start</div>
+            <div><b>POST</b> /api/outdoor/track/session/complete</div>
+            <div><b>POST</b> /api/outdoor/track/position</div>
+            <div><b>POST</b> /api/outdoor/track/search</div>
+          </div>
+          <p style={{ marginTop: 8, fontSize: 12, color: '#166534' }}>
+            These endpoints mirror the external API format exactly — no changes needed on the mobile app except the base URL.
+          </p>
+        </div>
       </article>
     </div>
   );

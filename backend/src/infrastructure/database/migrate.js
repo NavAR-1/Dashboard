@@ -13,6 +13,7 @@ async function migrate() {
     `ALTER TABLE navigation_sessions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'`,
     `ALTER TABLE navigation_sessions ADD COLUMN IF NOT EXISTS visited_node_ids JSONB NOT NULL DEFAULT '[]'`,
     `ALTER TABLE navigation_sessions ADD COLUMN IF NOT EXISTS client_created_at TIMESTAMPTZ DEFAULT NOW()`,
+    `ALTER TABLE navigation_sessions ADD COLUMN IF NOT EXISTS distance_meters DOUBLE PRECISION`,
     `ALTER TABLE navigation_sessions DROP CONSTRAINT IF EXISTS navigation_sessions_status_check`,
     `ALTER TABLE navigation_sessions DROP CONSTRAINT IF EXISTS navigation_sessions_session_status_check`,
     `UPDATE navigation_sessions
@@ -248,6 +249,200 @@ async function migrate() {
      WHERE r.role_key = 'admin'
        AND au.role_id IS NULL
        AND (au.role = 'admin' OR au.role IS NULL)`,
+
+    // ── Rename core tables to match design diagram ────────────────────────
+    // navigation_nodes → graph_nodes
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='navigation_nodes')
+          AND NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='graph_nodes')
+       THEN ALTER TABLE navigation_nodes RENAME TO graph_nodes;
+       END IF;
+     END $$`,
+    // routes → graph_edges
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='routes')
+          AND NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='graph_edges')
+       THEN ALTER TABLE routes RENAME TO graph_edges;
+       END IF;
+     END $$`,
+    // ar_markers → qr_anchors
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='ar_markers')
+          AND NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='qr_anchors')
+       THEN ALTER TABLE ar_markers RENAME TO qr_anchors;
+       END IF;
+     END $$`,
+
+    // ── Add explicit latitude/longitude columns to graph_nodes ────────────
+    `ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION`,
+    `ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`,
+    // Populate from PostGIS location where not yet set
+    `UPDATE graph_nodes
+     SET latitude  = ST_Y(location::geometry),
+         longitude = ST_X(location::geometry)
+     WHERE location IS NOT NULL
+       AND (latitude IS NULL OR longitude IS NULL)`,
+
+    // ── Add explicit latitude/longitude columns to qr_anchors ─────────────
+    `ALTER TABLE qr_anchors ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION`,
+    `ALTER TABLE qr_anchors ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`,
+    `UPDATE qr_anchors
+     SET latitude  = ST_Y(location::geometry),
+         longitude = ST_X(location::geometry)
+     WHERE location IS NOT NULL
+       AND (latitude IS NULL OR longitude IS NULL)`,
+
+    // ── Rename index that referenced old table name ───────────────────────
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_navigation_nodes_location')
+       THEN ALTER INDEX idx_navigation_nodes_location RENAME TO idx_graph_nodes_location;
+       END IF;
+     END $$`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_ar_markers_location')
+       THEN ALTER INDEX idx_ar_markers_location RENAME TO idx_qr_anchors_location;
+       END IF;
+     END $$`,
+
+    // ── Update visit_series view to use graph_nodes in heatmap ────────────
+    // (view itself doesn't reference those tables, nothing to change there)
+
+    // ── qr_scans.resolved_node_id FK now points to graph_nodes ───────────
+    // The FK was set on the column; after renaming the table the FK still works
+    // automatically in Postgres — no action needed.
+
+    // ── feedback.node_id FK still valid after rename ──────────────────────
+    // Same as above — Postgres tracks FKs by OID, not name.
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ── SEPARATE INDOOR / OUTDOOR SESSION TABLES ─────────────────────────
+    // indoor_sessions  → written by the Unity mobile app (always indoors)
+    // outdoor_sessions → written by outdoor navigation API + external sync
+    // navigation_sessions kept as legacy; no new writes go there.
+    // ════════════════════════════════════════════════════════════════════════
+
+    `CREATE TABLE IF NOT EXISTS indoor_sessions (
+       id                SERIAL PRIMARY KEY,
+       session_id        TEXT,
+       qr_id             TEXT,
+       destination       TEXT,
+       session_status    TEXT CHECK (session_status IS NULL OR session_status IN ('completed','cancelled')),
+       visited_node_ids  JSONB NOT NULL DEFAULT '[]',
+       client_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS indoor_sessions_session_id_idx
+       ON indoor_sessions(session_id) WHERE session_id IS NOT NULL`,
+
+    `CREATE TABLE IF NOT EXISTS outdoor_sessions (
+       id                SERIAL PRIMARY KEY,
+       session_id        TEXT,
+       qr_id             TEXT,
+       destination       TEXT,
+       session_status    TEXT CHECK (session_status IS NULL OR session_status IN ('completed','cancelled')),
+       distance_meters   FLOAT,
+       visited_node_ids  JSONB NOT NULL DEFAULT '[]',
+       client_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       source            TEXT NOT NULL DEFAULT 'mobile'
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS outdoor_sessions_session_id_idx
+       ON outdoor_sessions(session_id) WHERE session_id IS NOT NULL`,
+
+    // ── Migrate existing inside sessions → indoor_sessions ────────────────
+    `INSERT INTO indoor_sessions
+       (session_id, qr_id, destination, session_status, visited_node_ids, client_created_at)
+     SELECT session_id, qr_id, destination, session_status,
+            COALESCE(visited_node_ids,'[]'::jsonb),
+            COALESCE(client_created_at, NOW())
+       FROM navigation_sessions
+      WHERE (session_scope = 'inside' OR session_scope IS NULL)
+        AND session_id IS NOT NULL
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO indoor_sessions
+       (qr_id, destination, session_status, visited_node_ids, client_created_at)
+     SELECT qr_id, destination, session_status,
+            COALESCE(visited_node_ids,'[]'::jsonb),
+            COALESCE(client_created_at, NOW())
+       FROM navigation_sessions
+      WHERE (session_scope = 'inside' OR session_scope IS NULL)
+        AND session_id IS NULL`,
+
+    // ── Migrate existing outside sessions → outdoor_sessions ──────────────
+    `INSERT INTO outdoor_sessions
+       (session_id, qr_id, destination, session_status, visited_node_ids, client_created_at, source)
+     SELECT session_id, qr_id, destination, session_status,
+            COALESCE(visited_node_ids,'[]'::jsonb),
+            COALESCE(client_created_at, NOW()),
+            'migrated'
+       FROM navigation_sessions
+      WHERE session_scope = 'outside'
+        AND session_id IS NOT NULL
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO outdoor_sessions
+       (qr_id, destination, session_status, visited_node_ids, client_created_at, source)
+     SELECT qr_id, destination, session_status,
+            COALESCE(visited_node_ids,'[]'::jsonb),
+            COALESCE(client_created_at, NOW()),
+            'migrated'
+       FROM navigation_sessions
+      WHERE session_scope = 'outside'
+        AND session_id IS NULL`,
+
+    // ── Rebuild visit_series view to use indoor_sessions ──────────────────
+    `CREATE OR REPLACE VIEW visit_series AS
+       SELECT gs.day::date AS day,
+              COUNT(is2.id)::int AS route_requests,
+              COUNT(CASE WHEN is2.session_status = 'completed' THEN 1 END)::int AS successful_routes
+         FROM generate_series(
+                (NOW() - INTERVAL '6 days')::date,
+                NOW()::date,
+                '1 day'::interval
+              ) AS gs(day)
+         LEFT JOIN indoor_sessions is2
+           ON is2.client_created_at::date = gs.day::date
+        GROUP BY gs.day
+        ORDER BY gs.day`,
+
+    // ── Add from_name / to_name to outdoor_sessions ───────────────────────
+    // These store the human-readable location names from the outdoor nav API
+    // (external API uses "from_name"/"to_name", not QR anchor IDs)
+    `ALTER TABLE outdoor_sessions ADD COLUMN IF NOT EXISTS from_name TEXT`,
+    `ALTER TABLE outdoor_sessions ADD COLUMN IF NOT EXISTS to_name   TEXT`,
+    // Back-fill: if data was stored in qr_id / destination before this migration
+    `UPDATE outdoor_sessions
+       SET from_name = qr_id,
+           to_name   = destination
+     WHERE from_name IS NULL AND to_name IS NULL
+       AND (qr_id IS NOT NULL OR destination IS NOT NULL)`,
+
+    // ── Re-point feedback.session_id FK → indoor_sessions ─────────────────
+    `DO $$ BEGIN
+       ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_session_id_fkey;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE feedback
+         ADD CONSTRAINT feedback_indoor_session_id_fkey
+         FOREIGN KEY (session_id) REFERENCES indoor_sessions(id) ON DELETE SET NULL;
+     EXCEPTION WHEN duplicate_object THEN NULL;
+     END $$`,
+
+    // ── Demo outdoor rows in outdoor_sessions (idempotent) ─────────────────
+    `INSERT INTO outdoor_sessions (session_id,qr_id,destination,session_status,source,client_created_at)
+     SELECT 'demo-out-001','QR-B-G-Lobby','Block F - Main Lobby Node','completed','demo',NOW()-INTERVAL'2 hours'
+     WHERE NOT EXISTS(SELECT 1 FROM outdoor_sessions WHERE session_id='demo-out-001')`,
+    `INSERT INTO outdoor_sessions (session_id,qr_id,destination,session_status,source,client_created_at)
+     SELECT 'demo-out-002','QR-H-G-Spine','Block C - HPC Lab Ground','completed','demo',NOW()-INTERVAL'90 minutes'
+     WHERE NOT EXISTS(SELECT 1 FROM outdoor_sessions WHERE session_id='demo-out-002')`,
+    `INSERT INTO outdoor_sessions (session_id,qr_id,destination,session_status,source,client_created_at)
+     SELECT 'demo-out-003','QR-F-G-Lobby','Block B - Main Entrance Lobby','cancelled','demo',NOW()-INTERVAL'45 minutes'
+     WHERE NOT EXISTS(SELECT 1 FROM outdoor_sessions WHERE session_id='demo-out-003')`,
+    `INSERT INTO outdoor_sessions (session_id,qr_id,destination,session_status,source,client_created_at)
+     SELECT 'demo-out-004','QR-G-G-Reactor','Block H - Main Intersecting Corridor Ground','completed','demo',NOW()-INTERVAL'20 minutes'
+     WHERE NOT EXISTS(SELECT 1 FROM outdoor_sessions WHERE session_id='demo-out-004')`,
+    `INSERT INTO outdoor_sessions (session_id,qr_id,destination,session_status,source,client_created_at)
+     SELECT 'demo-out-005','QR-C-G-Corridor','Block G - Primary Reactor Lobby Zone','completed','demo',NOW()-INTERVAL'10 minutes'
+     WHERE NOT EXISTS(SELECT 1 FROM outdoor_sessions WHERE session_id='demo-out-005')`,
   ];
 
   for (const sql of steps) {

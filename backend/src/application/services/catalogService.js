@@ -1,16 +1,41 @@
 const { integer, number, text } = require('../../domain/validators');
 const { getFloorNodes, getFloorPois } = require('./floorDataService');
+
+const POI_NODE_TYPES = ['room', 'lab', 'office', 'clinic', 'cafe', 'library', 'toilet', 'elevator', 'stairs', 'entrance', 'parking', 'POI', 'destination'];
+
 function createCatalogService(repo){
   return {
     listBuildings: () => repo.listBuildings(),
     createBuilding: input => repo.createBuilding({ name:text(input.name,'name'), description:String(input.description || ''), longitude:number(input.longitude,'longitude'), latitude:number(input.latitude,'latitude') }),
     updateBuildingStatus: (id, input) => repo.updateBuildingStatus(integer(Number(id), 'id'), String(input.status || '').toLowerCase() === 'inactive' ? 'inactive' : 'active'),
     async listNodes(){
-      const nodes = await repo.listNodes();
-      return [...nodes, ...getFloorNodes()];
+      // Return only DB nodes — the frontend merges floor-file anchors on its own
+      return repo.listNodes();
     },
     async listPois(){
-      return getFloorPois();
+      // Merge DB POI nodes + floor-file destinations
+      const [dbNodes, floorPois] = await Promise.all([
+        repo.listNodes(),
+        Promise.resolve(getFloorPois())
+      ]);
+      // Pull nodes from DB that are POI types
+      const dbPois = dbNodes
+        .filter(n => POI_NODE_TYPES.includes(n.node_type))
+        .map(n => ({
+          id: n.id,
+          poi_name: n.node_name,
+          location_name: n.node_name,
+          floor_label: n.floor_label || 'Ground',
+          floor_id: null,
+          node_type: n.node_type,
+          entrance_node_ids: [],
+          latitude: n.latitude,
+          longitude: n.longitude,
+          is_published: n.is_published,
+          is_staff_only: n.is_staff_only,
+          source: 'database'
+        }));
+      return [...dbPois, ...floorPois];
     },
     createNode: input => repo.createNode({ 
       node_name:text(input.node_name,'node_name'), 

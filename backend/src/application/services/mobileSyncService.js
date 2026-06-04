@@ -42,7 +42,8 @@ function sanitize(row){
     session_status:   row.session_status || null,
     visited_node_ids: row.visited_node_ids || [],
     session_scope:    row.session_scope,
-    created_at:       row.client_created_at
+    created_at:       row.client_created_at,
+    distance_meters:  row.distance_meters !== null && row.distance_meters !== undefined ? Number(row.distance_meters) : null
   };
 }
 
@@ -69,24 +70,17 @@ function createMobileSyncService(repo){
       const saved = [];
       for(const item of items){
         const clientId = clientSessionId(item);
+        // Mobile = ALWAYS indoor → writes directly to indoor_sessions
+        const payload = {
+          qr_id:             text(sessionAnchorId(item), 'qr_id', 120),
+          destination:       nullableText(destinationNodeId(item)),
+          session_status:    null,
+          visited_node_ids:  [],
+          client_created_at: item.started_at || item.client_created_at || null,
+        };
         const row = await (clientId
-          ? repo.upsertSessionByClientId(clientId, {
-              session_scope:     'inside',
-              qr_id:             text(sessionAnchorId(item), 'qr_id', 120),
-              destination:       nullableText(destinationNodeId(item)),
-              session_status:    null,
-              visited_node_ids:  [],
-              client_created_at: item.started_at || item.client_created_at || null,
-              session_id:        clientId
-            })
-          : repo.createSession({
-              session_scope:     'inside',
-              qr_id:             text(sessionAnchorId(item), 'qr_id', 120),
-              destination:       nullableText(destinationNodeId(item)),
-              session_status:    null,
-              visited_node_ids:  [],
-              client_created_at: item.started_at || item.client_created_at || null
-            })
+          ? repo.upsertIndoorSessionByClientId(clientId, payload)
+          : repo.createIndoorSession(payload)
         );
         saved.push(sanitize(row));
       }
@@ -94,24 +88,22 @@ function createMobileSyncService(repo){
     },
 
     // POST /mobile/navigation-sessions/end
-    // Payload per session: { session_id, qr_id, visited_node_ids, destination_node_id?, session_status: "completed", ended_at? }
+    // Payload per session: { session_id, qr_id, visited_node_ids, destination_node_id?, ended_at? }
     async endSessions(input){
       const items = sessionArray(input);
       const saved = [];
       for(const item of items){
         const clientId = clientSessionId(item);
-        const update = {
-          session_scope:     normalizeSessionScope(item),
+        const payload = {
           qr_id:             sessionAnchorId(item),
           destination:       nullableText(destinationNodeId(item)),
           session_status:    'completed',
           visited_node_ids:  normalizeVisitedNodeIds(item),
           client_created_at: item.ended_at || item.client_created_at || null,
-          session_id:        clientId
         };
         const row = await (clientId
-          ? repo.upsertSessionByClientId(clientId, update)
-          : repo.createSession(update)
+          ? repo.upsertIndoorSessionByClientId(clientId, payload)
+          : repo.createIndoorSession(payload)
         );
         saved.push(sanitize(row));
       }
@@ -119,53 +111,48 @@ function createMobileSyncService(repo){
     },
 
     // POST /mobile/navigation-sessions/cancel
-    // Payload per session: { session_id, qr_id, session_status: "cancelled", cancelled_at? }
+    // Payload per session: { session_id, qr_id, cancelled_at? }
     async cancelSessions(input){
       const items = sessionArray(input);
       const saved = [];
       for(const item of items){
         const clientId = clientSessionId(item);
-        const update = {
-          session_scope:     normalizeSessionScope(item),
+        const payload = {
           qr_id:             sessionAnchorId(item),
           destination:       nullableText(destinationNodeId(item)),
           session_status:    'cancelled',
           visited_node_ids:  normalizeVisitedNodeIds(item),
           client_created_at: item.cancelled_at || item.canceled_at || item.client_created_at || null,
-          session_id:        clientId
         };
         const row = await (clientId
-          ? repo.upsertSessionByClientId(clientId, update)
-          : repo.createSession(update)
+          ? repo.upsertIndoorSessionByClientId(clientId, payload)
+          : repo.createIndoorSession(payload)
         );
         saved.push(sanitize(row));
       }
       return saved;
     },
 
-    // POST /mobile/sync — bulk offline upload
-    // Each session: { session_id, qr_id, visited_node_ids, status, started_at, ended_at }
+    // POST /mobile/sync — bulk offline upload (all mobile sessions = indoor)
     async sync(input){
       const items = sessionArray(input);
       const saved = [];
       for(const item of items){
         const clientId = clientSessionId(item);
         const statusRaw = String(item.session_status || item.status || '').toLowerCase();
-        const sessionStatus = statusRaw.includes('cancel') || statusRaw.includes('fail') ? 'cancelled'
-                            : statusRaw.includes('complete') || statusRaw.includes('end') ? 'completed'
+        const sessionStatus = statusRaw.includes('cancel') || statusRaw.includes('fail')     ? 'cancelled'
+                            : statusRaw.includes('complete') || statusRaw.includes('end')   ? 'completed'
                             : null;
-        const normalized = {
-          session_scope:     normalizeSessionScope(item),
+        const payload = {
           qr_id:             sessionAnchorId(item),
           destination:       nullableText(destinationNodeId(item)),
           session_status:    sessionStatus,
           visited_node_ids:  normalizeVisitedNodeIds(item),
           client_created_at: item.started_at || item.ended_at || item.client_created_at || null,
-          session_id:        clientId
         };
         const row = await (clientId
-          ? repo.upsertSessionByClientId(clientId, normalized)
-          : repo.createSession(normalized)
+          ? repo.upsertIndoorSessionByClientId(clientId, payload)
+          : repo.createIndoorSession(payload)
         );
         if(row) saved.push(sanitize(row));
       }
@@ -181,8 +168,9 @@ function createMobileSyncService(repo){
       return repo.nearestNode(number(input.latitude, 'latitude'), number(input.longitude, 'longitude'));
     },
 
-    listSessions: (filters = {}) => repo.listSessions(filters),
-    listSyncs:    ()             => repo.listSyncs(),
+    // Mobile sessions panel always shows indoor_sessions only
+    listSessions: (filters = {}) => repo.listIndoorSessions(filters),
+    listSyncs:    ()             => repo.listIndoorSyncs(),
 
     createFeedback: input => repo.createFeedback({
       type:       'feedback',

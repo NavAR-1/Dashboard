@@ -15,95 +15,264 @@ async function updateBuildingStatus(id, status){
   return result.rows[0] || null;
 }
 async function listNodes(){
-  const result = await db.query('SELECT id, node_name, floor_label, node_type, is_published, is_staff_only, ' + db.pointSelect() + ' FROM navigation_nodes ORDER BY id');
+  const result = await db.query('SELECT id, node_name, floor_label, node_type, is_published, is_staff_only, ' + db.pointSelect() + ' FROM graph_nodes ORDER BY id');
   return result.rows;
 }
 async function createNode(input){
-  const result = await db.query('INSERT INTO navigation_nodes (node_name, location, floor_label, node_type, is_published, is_staff_only) VALUES ($1, ' + db.pointValue('$2','$3') + ', $4, $5, $6, $7) RETURNING id, node_name, floor_label, node_type, is_published, is_staff_only, ' + db.pointSelect(), [input.node_name, input.longitude, input.latitude, input.floor_label || 'Ground', input.node_type || 'corridor', input.is_published !== false, input.is_staff_only === true]);
+  const result = await db.query('INSERT INTO graph_nodes (node_name, location, floor_label, node_type, is_published, is_staff_only) VALUES ($1, ' + db.pointValue('$2','$3') + ', $4, $5, $6, $7) RETURNING id, node_name, floor_label, node_type, is_published, is_staff_only, ' + db.pointSelect(), [input.node_name, input.longitude, input.latitude, input.floor_label || 'Ground', input.node_type || 'corridor', input.is_published !== false, input.is_staff_only === true]);
   return result.rows[0];
 }
 async function listRoutes(){
-  const result = await db.query('SELECT r.id, r.start_node, r.end_node, r.distance, r.is_accessible, sn.node_name AS start_name, en.node_name AS end_name FROM routes r LEFT JOIN navigation_nodes sn ON sn.id = r.start_node LEFT JOIN navigation_nodes en ON en.id = r.end_node ORDER BY r.id');
+  const result = await db.query('SELECT r.id, r.start_node, r.end_node, r.distance, r.is_accessible, sn.node_name AS start_name, en.node_name AS end_name FROM graph_edges r LEFT JOIN graph_nodes sn ON sn.id = r.start_node LEFT JOIN graph_nodes en ON en.id = r.end_node ORDER BY r.id');
   return result.rows;
 }
 async function createRoute(input){
-  const result = await db.query('INSERT INTO routes (start_node, end_node, distance, is_accessible) VALUES ($1, $2, $3, $4) RETURNING id, start_node, end_node, distance, is_accessible', [input.start_node, input.end_node, input.distance, input.is_accessible !== false]);
+  const result = await db.query('INSERT INTO graph_edges (start_node, end_node, distance, is_accessible) VALUES ($1, $2, $3, $4) RETURNING id, start_node, end_node, distance, is_accessible', [input.start_node, input.end_node, input.distance, input.is_accessible !== false]);
   return result.rows[0];
 }
 async function listMarkers(){
-  const result = await db.query('SELECT am.id, am.marker_name, am.model_path, am.linked_node, nn.node_name AS linked_node_name, am.status, ' + db.pointSelect('am.location') + ' FROM ar_markers am LEFT JOIN navigation_nodes nn ON nn.id = am.linked_node ORDER BY am.id');
+  const result = await db.query('SELECT am.id, am.marker_name, am.model_path, am.linked_node, nn.node_name AS linked_node_name, am.status, ' + db.pointSelect('am.location') + ' FROM qr_anchors am LEFT JOIN graph_nodes nn ON nn.id = am.linked_node ORDER BY am.id');
   return result.rows;
 }
 async function createMarker(input){
-  const result = await db.query('INSERT INTO ar_markers (marker_name, location, model_path, linked_node, status) VALUES ($1, ' + db.pointValue('$2','$3') + ', $4, $5, $6) RETURNING id, marker_name, model_path, linked_node, status, ' + db.pointSelect(), [input.marker_name, input.longitude, input.latitude, input.model_path || '', input.linked_node || null, input.status || 'active']);
+  const result = await db.query('INSERT INTO qr_anchors (marker_name, location, model_path, linked_node, status) VALUES ($1, ' + db.pointValue('$2','$3') + ', $4, $5, $6) RETURNING id, marker_name, model_path, linked_node, status, ' + db.pointSelect(), [input.marker_name, input.longitude, input.latitude, input.model_path || '', input.linked_node || null, input.status || 'active']);
   return result.rows[0];
 }
-async function createSession(input){
+// ═══════════════════════════════════════════════════════════════════════════
+// ── INDOOR SESSIONS  (Unity mobile app — always indoors) ─────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function createIndoorSession(input) {
   const result = await db.query(
-    `INSERT INTO navigation_sessions
-       (session_scope, qr_id, destination, session_status, visited_node_ids, client_created_at, session_id)
-     VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6::timestamptz, NOW()), $7)
+    `INSERT INTO indoor_sessions
+       (session_id, qr_id, destination, session_status, visited_node_ids, client_created_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6::timestamptz, NOW()))
      RETURNING *`,
     [
-      input.session_scope || 'inside',
+      input.session_id || input.client_session_id || null,
       input.qr_id || null,
       input.destination || input.end_node || null,
       input.session_status || null,
       JSON.stringify(input.visited_node_ids || []),
-      input.client_created_at || null,
-      input.session_id || input.client_session_id || null
+      input.client_created_at || null
     ]
   );
-  await createSyncLog('mobile', 'session.create', 'navigation_session', String(result.rows[0].id), 'insert', { session_status: input.session_status || null, qr_id: input.qr_id || null });
+  await createSyncLog('mobile', 'indoor_session.create', 'indoor_session', String(result.rows[0].id), 'insert', { qr_id: input.qr_id || null });
   return result.rows[0];
 }
 
-// Upsert by session_id (client UUID): update if exists, create if not.
-// Used by /end, /cancel, and /sync when the mobile provides its own UUID.
-async function upsertSessionByClientId(clientSessionId, input){
+async function updateIndoorSession(id, input) {
+  const result = await db.query(
+    `UPDATE indoor_sessions
+     SET qr_id             = COALESCE($2, qr_id),
+         destination       = COALESCE($3, destination),
+         session_status    = COALESCE($4, session_status),
+         visited_node_ids  = $5::jsonb,
+         client_created_at = COALESCE($6::timestamptz, client_created_at)
+     WHERE id = $1
+     RETURNING *`,
+    [
+      id,
+      input.qr_id || null,
+      input.destination || input.end_node || null,
+      input.session_status || null,
+      JSON.stringify(input.visited_node_ids || []),
+      input.client_created_at || null
+    ]
+  );
+  if (result.rows[0]) await createSyncLog('mobile', 'indoor_session.update', 'indoor_session', String(id), 'update', { session_status: input.session_status || null });
+  return result.rows[0] || null;
+}
+
+async function upsertIndoorSessionByClientId(clientSessionId, input) {
   const existing = await db.query(
-    'SELECT id FROM navigation_sessions WHERE session_id = $1 LIMIT 1',
+    'SELECT id FROM indoor_sessions WHERE session_id = $1 LIMIT 1',
     [clientSessionId]
   );
-  if(existing.rowCount){
-    return updateSession(existing.rows[0].id, input);
+  if (existing.rowCount) {
+    return updateIndoorSession(existing.rows[0].id, input);
   }
-  return createSession({ ...input, session_id: clientSessionId });
+  return createIndoorSession({ ...input, session_id: clientSessionId });
 }
-async function createSessions(items){
+
+async function listIndoorSessions(filters = {}) {
+  let q = `
+    SELECT s.*,
+           gn.node_name AS destination_name,
+           qa.marker_name AS ar_marker_name
+      FROM indoor_sessions s
+      LEFT JOIN graph_nodes gn ON gn.id::text = s.destination
+      LEFT JOIN qr_anchors  qa ON qa.marker_name = s.qr_id OR qa.id::text = s.qr_id
+  `;
+  const params = [];
+  const where = [];
+  if (filters.status === 'active')  where.push("s.client_created_at >= NOW() - INTERVAL '15 minutes'");
+  if (filters.status === 'failed')  where.push("s.session_status = 'cancelled'");
+  if (where.length) q += ' WHERE ' + where.join(' AND ');
+  q += ' ORDER BY s.id DESC';
+  return (await db.query(q, params)).rows;
+}
+
+async function listIndoorSyncs() {
+  const r = await db.query(
+    `SELECT 'inside' AS session_scope,
+            MAX(client_created_at) AS last_sync_time,
+            COUNT(*)::int AS session_count,
+            SUM(CASE WHEN session_status='completed' THEN 1 ELSE 0 END)::int AS successful_count
+       FROM indoor_sessions`
+  );
+  return r.rows[0] ? [r.rows[0]] : [];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── OUTDOOR SESSIONS  (outdoor navigation API + external sync) ────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function createOutdoorSession(input) {
+  const result = await db.query(
+    `INSERT INTO outdoor_sessions
+       (session_id, from_name, to_name, qr_id, destination,
+        session_status, distance_meters, visited_node_ids, client_created_at, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, COALESCE($9::timestamptz, NOW()), $10)
+     RETURNING *`,
+    [
+      input.session_id || null,
+      input.from_name || input.qr_id || null,           // human-readable start location
+      input.to_name   || input.destination || null,     // human-readable end location
+      input.qr_id     || input.from_name || null,       // also keep qr_id for compat
+      input.destination || input.to_name || null,
+      input.session_status || null,
+      input.distance_meters || null,
+      JSON.stringify(input.visited_node_ids || []),
+      input.client_created_at || null,
+      input.source || 'mobile'
+    ]
+  );
+  await createSyncLog('outdoor', 'outdoor_session.create', 'outdoor_session', String(result.rows[0].id), 'insert', { from: input.from_name, to: input.to_name });
+  return result.rows[0];
+}
+
+async function updateOutdoorSession(id, input) {
+  const result = await db.query(
+    `UPDATE outdoor_sessions
+     SET from_name         = COALESCE($2, from_name),
+         to_name           = COALESCE($3, to_name),
+         session_status    = COALESCE($4, session_status),
+         distance_meters   = COALESCE($5, distance_meters),
+         visited_node_ids  = $6::jsonb,
+         client_created_at = COALESCE($7::timestamptz, client_created_at)
+     WHERE id = $1
+     RETURNING *`,
+    [
+      id,
+      input.from_name || input.qr_id || null,
+      input.to_name   || input.destination || null,
+      input.session_status || null,
+      input.distance_meters || null,
+      JSON.stringify(input.visited_node_ids || []),
+      input.client_created_at || null
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function upsertOutdoorSessionByClientId(clientSessionId, input) {
+  const existing = await db.query(
+    'SELECT id FROM outdoor_sessions WHERE session_id = $1 LIMIT 1',
+    [clientSessionId]
+  );
+  if (existing.rowCount) {
+    return updateOutdoorSession(existing.rows[0].id, input);
+  }
+  return createOutdoorSession({ ...input, session_id: clientSessionId });
+}
+
+async function listOutdoorSessions(filters = {}) {
+  let q = `SELECT * FROM outdoor_sessions`;
+  const where = [];
+  if (filters.status === 'active') where.push("client_created_at >= NOW() - INTERVAL '15 minutes'");
+  if (filters.status === 'failed') where.push("session_status = 'cancelled'");
+  if (where.length) q += ' WHERE ' + where.join(' AND ');
+  q += ' ORDER BY id DESC';
+  return (await db.query(q)).rows;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── LEGACY shims — route old calls to the right table ────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function createSession(input) {
+  return (input.session_scope || 'inside') === 'outside'
+    ? createOutdoorSession(input)
+    : createIndoorSession(input);
+}
+
+// Upsert by session_id (client UUID): update if exists, create if not.
+async function upsertSessionByClientId(clientSessionId, input) {
+  return (input.session_scope || 'inside') === 'outside'
+    ? upsertOutdoorSessionByClientId(clientSessionId, input)
+    : upsertIndoorSessionByClientId(clientSessionId, input);
+}
+
+async function createSessions(items) {
   const saved = [];
-  for(const item of items) saved.push(await createSession(item));
+  for (const item of items) saved.push(await createSession(item));
   return saved;
 }
 async function nearestNode(latitude, longitude){
-  const result = await db.query('SELECT id, node_name, ' + db.pointSelect() + ', ST_Distance(location, ' + db.pointValue('$1','$2') + ') AS distance_meters FROM navigation_nodes ORDER BY location <-> ' + db.pointValue('$1','$2') + ' LIMIT 1', [longitude, latitude]);
+  const result = await db.query('SELECT id, node_name, ' + db.pointSelect() + ', ST_Distance(location, ' + db.pointValue('$1','$2') + ') AS distance_meters FROM graph_nodes ORDER BY location <-> ' + db.pointValue('$1','$2') + ' LIMIT 1', [longitude, latitude]);
   return result.rows[0] || null;
 }
 async function dashboardCounts(){
-  const tables = ['buildings','navigation_nodes','routes','ar_markers','navigation_sessions'];
-  const values = await Promise.all(tables.map(table => db.query('SELECT COUNT(*)::int AS count FROM ' + table)));
-  return { buildings:values[0].rows[0].count, nodes:values[1].rows[0].count, routes:values[2].rows[0].count, markers:values[3].rows[0].count, sessions:values[4].rows[0].count };
+  const [b, n, r, m, si, so] = await Promise.all([
+    db.query('SELECT COUNT(*)::int AS c FROM buildings'),
+    db.query('SELECT COUNT(*)::int AS c FROM graph_nodes'),
+    db.query('SELECT COUNT(*)::int AS c FROM graph_edges'),
+    db.query('SELECT COUNT(*)::int AS c FROM qr_anchors'),
+    db.query('SELECT COUNT(*)::int AS c FROM indoor_sessions'),
+    db.query('SELECT COUNT(*)::int AS c FROM outdoor_sessions'),
+  ]);
+  return {
+    buildings: b.rows[0].c,
+    nodes:     n.rows[0].c,
+    routes:    r.rows[0].c,
+    markers:   m.rows[0].c,
+    indoor_sessions:  si.rows[0].c,
+    outdoor_sessions: so.rows[0].c,
+    sessions: si.rows[0].c + so.rows[0].c   // combined for top-level KPI
+  };
 }
 async function usageSeries(){
   const result = await db.query("SELECT to_char(day, 'Dy') AS label, route_requests::int, successful_routes::int FROM visit_series ORDER BY day");
   return result.rows;
 }
 async function popularNodes(){
-  const result = await db.query('SELECT nn.id, nn.node_name, COUNT(ns.id)::int AS visits FROM navigation_nodes nn LEFT JOIN navigation_sessions ns ON ns.destination = nn.id::text GROUP BY nn.id, nn.node_name ORDER BY visits DESC, nn.id LIMIT 8');
+  // Counts from indoor_sessions (indoor navigation — QR anchor → node destination)
+  const result = await db.query(`
+    SELECT nn.id, nn.node_name, COUNT(s.id)::int AS visits
+      FROM graph_nodes nn
+      LEFT JOIN indoor_sessions s ON s.destination = nn.id::text
+     GROUP BY nn.id, nn.node_name
+     ORDER BY visits DESC, nn.id
+     LIMIT 8`);
   return result.rows;
 }
 async function heatPoints(){
+  // Intensity based on indoor sessions only (indoor node passage counts)
   const result = await db.query(`
     WITH session_nodes AS (
-      SELECT destination::text AS node_id FROM navigation_sessions WHERE destination IS NOT NULL
+      SELECT destination::text AS node_id FROM indoor_sessions WHERE destination IS NOT NULL
       UNION ALL
-      SELECT jsonb_array_elements_text(COALESCE(visited_node_ids, '[]'::jsonb)) AS node_id FROM navigation_sessions
+      SELECT jsonb_array_elements_text(COALESCE(visited_node_ids, '[]'::jsonb)) AS node_id FROM indoor_sessions
     )
-    SELECT nn.id, nn.node_name, ST_Y(nn.location::geometry) AS latitude, ST_X(nn.location::geometry) AS longitude, COUNT(sn.node_id)::int AS intensity
-    FROM navigation_nodes nn
-    LEFT JOIN session_nodes sn ON sn.node_id = nn.id::text
-    GROUP BY nn.id, nn.node_name, nn.location
-    ORDER BY intensity DESC, nn.id
+    SELECT nn.id, nn.node_name,
+           ST_Y(nn.location::geometry) AS latitude,
+           ST_X(nn.location::geometry) AS longitude,
+           COUNT(sn.node_id)::int AS intensity
+      FROM graph_nodes nn
+      LEFT JOIN session_nodes sn ON sn.node_id = nn.id::text
+     GROUP BY nn.id, nn.node_name, nn.location
+     ORDER BY intensity DESC, nn.id
   `);
   return result.rows;
 }
@@ -327,71 +496,41 @@ function titleCase(value){
   return String(value).replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
 }
 
+// Legacy updateSession — routes to correct table
 async function updateSession(id, input){
-  const result = await db.query(
-    `UPDATE navigation_sessions
-     SET session_scope = $2,
-         qr_id = COALESCE($3, qr_id),
-         destination = COALESCE($4, destination),
-         session_status = COALESCE($5, session_status),
-         visited_node_ids = $6::jsonb,
-         client_created_at = COALESCE($7::timestamptz, client_created_at)
-     WHERE id = $1
-     RETURNING *`,
-    [
-      id,
-      input.session_scope || 'inside',
-      input.qr_id || null,
-      input.destination || input.end_node || null,
-      input.session_status || null,
-      JSON.stringify(input.visited_node_ids || []),
-      input.client_created_at || null
-    ]
-  );
-  if(result.rows[0]) await createSyncLog('mobile', 'session.update', 'navigation_session', String(id), 'update', { session_status: input.session_status || null, qr_id: input.qr_id || null });
-  return result.rows[0] || null;
+  if ((input.session_scope || 'inside') === 'outside') {
+    return updateOutdoorSession(id, input);
+  }
+  return updateIndoorSession(id, input);
 }
 
+// Legacy listSessions — routes to correct table by scope
 async function listSessions(filters = {}){
-  let queryText = `
-    SELECT
-      ns.*,
-      COALESCE(ns.qr_id, dm.marker_name, CASE WHEN ns.destination IS NOT NULL THEN 'QR-' || ns.destination::text ELSE NULL END) AS qr_id,
-      en.node_name AS destination_name,
-      COALESCE(am.id, dm.id) AS ar_marker_db_id,
-      COALESCE(am.marker_name, dm.marker_name) AS ar_marker_name
-    FROM navigation_sessions ns
-    LEFT JOIN navigation_nodes en ON en.id::text = ns.destination
-    LEFT JOIN ar_markers am ON am.marker_name = ns.qr_id OR am.id::text = ns.qr_id
-    LEFT JOIN ar_markers dm ON dm.linked_node::text = ns.destination
-  `;
-  const params = [];
-  const where = [];
-  if(filters.status === 'active'){
-    where.push("ns.client_created_at >= NOW() - INTERVAL '15 minutes'");
-  } else if(filters.status === 'failed'){
-    where.push("ns.session_status = 'cancelled'");
-  }
-  if(filters.scope === 'inside' || filters.scope === 'outside'){
-    params.push(filters.scope);
-    where.push(`ns.session_scope = $${params.length}`);
-  }
-  if(where.length) queryText += ' WHERE ' + where.join(' AND ');
-  queryText += ' ORDER BY ns.id DESC';
-  const result = await db.query(queryText, params);
-  return result.rows;
+  if (filters.scope === 'outside') return listOutdoorSessions(filters);
+  return listIndoorSessions(filters);
 }
 
 async function listSyncs(){
-  const result = await db.query(
-    "SELECT session_scope, MAX(client_created_at) AS last_sync_time, COUNT(*)::int AS session_count, SUM(CASE WHEN session_status = 'completed' THEN 1 ELSE 0 END)::int AS successful_count FROM navigation_sessions GROUP BY session_scope ORDER BY last_sync_time DESC"
-  );
+  // Combined sync summary from both tables
+  const [inR, outR] = await Promise.all([
+    db.query(`SELECT 'inside' AS session_scope,
+                     MAX(client_created_at) AS last_sync_time,
+                     COUNT(*)::int AS session_count,
+                     SUM(CASE WHEN session_status='completed' THEN 1 ELSE 0 END)::int AS successful_count
+               FROM indoor_sessions`),
+    db.query(`SELECT 'outside' AS session_scope,
+                     MAX(client_created_at) AS last_sync_time,
+                     COUNT(*)::int AS session_count,
+                     SUM(CASE WHEN session_status='completed' THEN 1 ELSE 0 END)::int AS successful_count
+               FROM outdoor_sessions`)
+  ]);
+  const result = { rows: [...inR.rows, ...outR.rows].filter(r => r.session_count > 0) };
   return result.rows;
 }
 
 async function listQrScans(){
   const result = await db.query(
-    'SELECT qs.*, nn.node_name AS node_name FROM qr_scans qs LEFT JOIN navigation_nodes nn ON nn.id = qs.resolved_node_id ORDER BY qs.id DESC'
+    'SELECT qs.*, nn.node_name AS node_name FROM qr_scans qs LEFT JOIN graph_nodes nn ON nn.id = qs.resolved_node_id ORDER BY qs.id DESC'
   );
   return result.rows;
 }
@@ -423,15 +562,15 @@ async function patchPoiVisibility(id, input){
   }
   if(setClauses.length === 0) return null;
   const result = await db.query(
-    `UPDATE navigation_nodes SET ${setClauses.join(', ')} WHERE id = $1 RETURNING id, node_name, is_published, is_staff_only`,
+    `UPDATE graph_nodes SET ${setClauses.join(', ')} WHERE id = $1 RETURNING id, node_name, is_published, is_staff_only`,
     params
   );
   return result.rows[0] || null;
 }
 
 async function getAccessibilityOverview(){
-  const routesRes = await db.query('SELECT COUNT(*)::int AS total, SUM(CASE WHEN is_accessible THEN 1 ELSE 0 END)::int AS accessible FROM routes');
-  const nodesRes = await db.query("SELECT COUNT(*)::int AS total FROM navigation_nodes WHERE node_type = 'stairs'");
+  const routesRes = await db.query('SELECT COUNT(*)::int AS total, SUM(CASE WHEN is_accessible THEN 1 ELSE 0 END)::int AS accessible FROM graph_edges');
+  const nodesRes = await db.query("SELECT COUNT(*)::int AS total FROM graph_nodes WHERE node_type = 'stairs'");
   const totalRoutes = routesRes.rows[0].total || 0;
   const accessibleRoutes = routesRes.rows[0].accessible || 0;
   const stairNodes = nodesRes.rows[0].total || 0;
@@ -461,9 +600,9 @@ async function resolveSessionDbId(sessionIdInput){
   if(!sessionIdInput) return null;
   const asInt = Number(sessionIdInput);
   if(Number.isInteger(asInt) && asInt > 0) return asInt;
-  // UUID string — look up by session_id
+  // UUID string — look in indoor_sessions first (feedback comes from mobile/indoor)
   const r = await db.query(
-    'SELECT id FROM navigation_sessions WHERE session_id = $1 LIMIT 1',
+    'SELECT id FROM indoor_sessions WHERE session_id = $1 LIMIT 1',
     [String(sessionIdInput)]
   );
   return r.rows[0]?.id || null;
@@ -480,7 +619,8 @@ async function createFeedback(input){
 }
 
 async function listFeedback(type){
-  let queryText = 'SELECT f.*, ns.qr_id, nn.node_name FROM feedback f LEFT JOIN navigation_sessions ns ON ns.id = f.session_id LEFT JOIN navigation_nodes nn ON nn.id = f.node_id';
+  // Feedback session_id references indoor_sessions (feedback comes from the mobile/indoor app)
+  let queryText = 'SELECT f.*, is2.qr_id, nn.node_name FROM feedback f LEFT JOIN indoor_sessions is2 ON is2.id = f.session_id LEFT JOIN graph_nodes nn ON nn.id = f.node_id';
   const params = [];
   if(type){
     queryText += ' WHERE f.type = $1';
@@ -574,14 +714,72 @@ async function createSyncLog(source, operation, recordType, dedupeKey, action, d
   return result.rows[0];
 }
 
+async function blockHeatData() {
+  // Uses indoor_sessions — block heat = how many indoor navigation sessions
+  // passed through each building block (destination + visited nodes)
+  const result = await db.query(`
+    WITH session_nodes AS (
+      SELECT destination::text AS node_id
+        FROM indoor_sessions
+       WHERE destination IS NOT NULL
+      UNION ALL
+      SELECT jsonb_array_elements_text(COALESCE(visited_node_ids, '[]'::jsonb)) AS node_id
+        FROM indoor_sessions
+    ),
+    tagged AS (
+      SELECT gn.id::text AS node_id,
+             CASE
+               WHEN gn.node_name LIKE 'Block B%' THEN 'B'
+               WHEN gn.node_name LIKE 'Block C%' THEN 'C'
+               WHEN gn.node_name LIKE 'Block F%' THEN 'F'
+               WHEN gn.node_name LIKE 'Block G%' THEN 'G'
+               WHEN gn.node_name LIKE 'Block H%' THEN 'H'
+             END AS block_id
+        FROM graph_nodes gn
+       WHERE gn.node_name ~ '^Block [BCFGH]'
+    )
+    SELECT t.block_id, COALESCE(COUNT(sn.node_id), 0)::int AS visit_count
+      FROM tagged t
+      LEFT JOIN session_nodes sn ON sn.node_id = t.node_id
+     GROUP BY t.block_id
+     ORDER BY t.block_id
+  `);
+  return result.rows; // [{ block_id: 'B', visit_count: 42 }, ...]
+}
+
 module.exports = {
-  listBuildings, createBuilding, updateBuildingStatus, listNodes, createNode, listRoutes, createRoute, listMarkers, createMarker,
-  createSession, updateSession, upsertSessionByClientId, createSessions, nearestNode, dashboardCounts, usageSeries, popularNodes, heatPoints, 
-  findAdminByEmail, findAdminById, updateAdminLastLogin, getPermissionsForAdmin, getAccessControlOverview, 
-  createRole, updateRole, deleteRole, assignUserRole, createAdminUser, updateAdminUser, deleteAdminUser, 
+  // Nodes / edges / markers / buildings
+  listBuildings, createBuilding, updateBuildingStatus,
+  listNodes, createNode,
+  listRoutes, createRoute,
+  listMarkers, createMarker,
+
+  // Indoor sessions (mobile Unity app)
+  createIndoorSession, updateIndoorSession, upsertIndoorSessionByClientId,
+  listIndoorSessions, listIndoorSyncs,
+
+  // Outdoor sessions (outdoor navigation API)
+  createOutdoorSession, updateOutdoorSession, upsertOutdoorSessionByClientId,
+  listOutdoorSessions,
+
+  // Legacy shims (route to the right table based on scope)
+  createSession, updateSession, upsertSessionByClientId, createSessions,
+
+  // Dashboard / analytics
+  nearestNode, dashboardCounts, usageSeries, popularNodes, heatPoints, blockHeatData,
+
+  // Auth / access control
+  findAdminByEmail, findAdminById, updateAdminLastLogin, getPermissionsForAdmin,
+  getAccessControlOverview,
+  createRole, updateRole, deleteRole, assignUserRole,
+  createAdminUser, updateAdminUser, deleteAdminUser,
   createPermissionModule, updatePermissionModule, deletePermissionModule,
-  listSessions, listSyncs, listQrScans, listPoiCategories, createPoiCategory, patchPoiVisibility, 
-  getAccessibilityOverview, listAccessLogs, createAccessLog, createFeedback, listFeedback, 
-  updateFeedbackStatus, getSettings, getSettingsByCategory, updateSettingsByCategory,
-  mergeSourceRecord, mergeSourceRecords, listSourceRecords, createSyncLog
+
+  // Misc
+  listSessions, listSyncs, listQrScans, listPoiCategories, createPoiCategory, patchPoiVisibility,
+  getAccessibilityOverview, listAccessLogs, createAccessLog,
+  createFeedback, listFeedback, updateFeedbackStatus,
+  getSettings, getSettingsByCategory, updateSettingsByCategory,
+  mergeSourceRecord, mergeSourceRecords, listSourceRecords, createSyncLog,
+  blockHeatData
 };

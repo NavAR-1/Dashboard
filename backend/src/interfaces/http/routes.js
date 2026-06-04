@@ -53,6 +53,15 @@ function createRoutes(controllers){
   router.get('/outdoor/map/edges', requirePermission('maps.read'), outdoorNavigationController.mapEdges);
   router.get('/outdoor/route', requirePermission('routes.read'), outdoorNavigationController.route);
   router.get('/outdoor/recent-searches', requirePermission('dashboard.read'), outdoorNavigationController.recentSearches);
+  router.get('/outdoor/campus-nodes', requirePermission('maps.read'), outdoorNavigationController.campusNodes);
+
+  // ── Outdoor tracking proxy — NO auth required ─────────────────────────
+  // The outdoor mobile app should set its base URL to THIS backend.
+  // Data is stored locally in outdoor_sessions AND forwarded to the external API.
+  router.post('/outdoor/track/session/start',    outdoorNavigationController.trackSessionStart);
+  router.post('/outdoor/track/session/complete', outdoorNavigationController.trackSessionComplete);
+  router.post('/outdoor/track/position',         outdoorNavigationController.trackPosition);
+  router.post('/outdoor/track/search',           outdoorNavigationController.trackSearch);
 
   router.get('/admin/qr-scans', requirePermission('qr_anchors.read'), catalogController.listQrScans);
   router.get('/poi-categories', requirePermission('facilities.read'), catalogController.listPoiCategories);

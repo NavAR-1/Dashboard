@@ -3,7 +3,7 @@ const { getFloorDataSummary } = require('./floorDataService');
 function createDashboardService(repo){
   return {
     async getDashboard(){
-      const [kpis, navigationUsage, popularNodes, heatPoints] = await Promise.all([repo.dashboardCounts(), repo.usageSeries(), repo.popularNodes(), repo.heatPoints()]);
+      const [kpis, navigationUsage, popularNodes, heatPoints, blockHeat] = await Promise.all([repo.dashboardCounts(), repo.usageSeries(), repo.popularNodes(), repo.heatPoints(), repo.blockHeatData()]);
       const floorData = getFloorDataSummary();
       return {
         kpis: { ...kpis, floor_anchors: floorData.anchors, floor_pois: floorData.destinations, floor_nodes: floorData.nodes },
@@ -11,6 +11,7 @@ function createDashboardService(repo){
         navigationUsage,
         popularNodes,
         heatPoints,
+        blockHeat,
         systemStatus:[
           { name:'API Server', status:'Operational' },
           { name:'PostgreSQL', status:'Connected' },

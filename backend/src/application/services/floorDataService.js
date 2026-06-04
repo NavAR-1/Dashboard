@@ -1,9 +1,14 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Floor data directory: set FLOOR_DATA_DIR in .env for a custom location,
+// otherwise defaults to <project-root>/floor-data/
+const FLOOR_DATA_DIR = process.env.FLOOR_DATA_DIR ||
+  path.join(__dirname, '..', '..', '..', '..', 'floor-data');
+
 const FLOOR_FILES = [0, 1, 2, 3, 5].map(floor => ({
   floor,
-  path: path.join('C:', 'Users', 'user', 'Downloads', 'Telegram Desktop', `Floor${floor}_Data.json`)
+  path: path.join(FLOOR_DATA_DIR, `Floor${floor}_Data.json`)
 }));
 
 let cache = null;
